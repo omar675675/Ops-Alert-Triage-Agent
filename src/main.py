@@ -332,6 +332,59 @@ def log_event(alert_id, event_type, data):
     with open(AUDIT_LOG_PATH, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
+def check_reason_is_grounded(alert_text, runbook, reason, diagnostics_gathered):
+    diagnostics_text = ""
+    for diagnostic_result in diagnostics_gathered:
+        diagnostics_text = diagnostics_text + json.dumps(diagnostic_result) + "\n"
+
+    system_prompt = (
+        "You are a fact-checker. You will be given an alert, a runbook, results "
+        "from any diagnostic checks that were run, and a reason someone gave for "
+        "a decision. Check whether every factual claim in the reason is actually "
+        "supported by the alert, the runbook, or the diagnostic results.\n\n"
+        "A claim does not need to be an exact quote. If any of these sources "
+        "states something, restating it in different words still counts as "
+        "grounded. Only flag a claim if it states something that none of these "
+        "sources said at all, or that contradicts them.\n\n"
+        "Reply in exactly this format, nothing else:\n"
+        "grounded: yes or no\n"
+        "explanation: one sentence, quoting the unsupported claim if grounded is no"
+    )
+
+    user_message = (
+        f"ALERT:\n{alert_text}\n\n"
+        f"RUNBOOK:\n{runbook}\n\n"
+        f"DIAGNOSTIC RESULTS:\n{diagnostics_text}\n\n"
+        f"REASON TO CHECK:\n{reason}"
+    )
+
+    response = llm.chat.completions.create(
+        model=config["classifier_model"],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0,
+    )
+
+    raw_reply = response.choices[0].message.content.strip()
+    reply_lines = raw_reply.splitlines()
+
+    parsed = {}
+    for line in reply_lines:
+        if ": " in line:
+            parts = line.split(": ", 1)
+            key = parts[0].strip()
+            value = parts[1].strip()
+            parsed[key] = value
+
+    grounded = parsed.get("grounded")
+    explanation = parsed.get("explanation", "")
+
+    if grounded not in ("yes", "no"):
+        raise ValueError(f"unexpected grounded-check format:\n{raw_reply}")
+
+    return {"grounded": grounded == "yes", "explanation": explanation}
 
 def handle_alert(alert_text):
     alert_id = str(uuid.uuid4())[:8]
@@ -362,6 +415,8 @@ def handle_alert(alert_text):
     ]
 
     recorded_decision = None
+    diagnostics_gathered = []
+
 
     while True:
         response = llm.chat.completions.create(
@@ -372,6 +427,17 @@ def handle_alert(alert_text):
         )
 
         message = response.choices[0].message
+
+        response = llm.chat.completions.create(
+            model=config["classifier_model"],
+            messages=messages,
+            tools=tools,
+            temperature=0,
+        )
+
+        message = response.choices[0].message
+        print("raw content:", repr(message.content))
+        print("tool_calls:", message.tool_calls)
 
         if not message.tool_calls:
             log_event(alert_id, "error", {"message": "model did not call a tool", "raw_reply": message.content})
@@ -388,6 +454,7 @@ def handle_alert(alert_text):
         if tool_name == "check_service_status":
             function_to_call = AVAILABLE_FUNCTIONS[tool_name]
             tool_result = function_to_call(**arguments)
+            diagnostics_gathered.append(tool_result)
             log_event(alert_id, "diagnostic", {"tool_called": tool_name, "result": tool_result})
 
             messages.append({"role": "assistant", "tool_calls": [tool_call]})
@@ -397,8 +464,17 @@ def handle_alert(alert_text):
         # the model recording its decision: save it, feed it back, keep going
         if tool_name == "record_decision":
             recorded_decision = arguments["decision"]
-            log_event(alert_id, "decision", {"decision": arguments["decision"], "reason": arguments["reason"]})
-            print("decision:", arguments["decision"])
+
+            grounding_check = check_reason_is_grounded(alert_text, runbook, arguments["reason"], diagnostics_gathered)
+            log_event(alert_id, "guardrail_check", grounding_check)
+
+            if not grounding_check["grounded"]:
+                log_event(alert_id, "error", {"message": "decision reason not grounded, forcing escalate", "explanation": grounding_check["explanation"]})
+                recorded_decision = "escalate"
+                arguments["reason"] = f"Forced escalation: original reasoning was not grounded in the alert or runbook ({grounding_check['explanation']})"
+
+            log_event(alert_id, "decision", {"decision": recorded_decision, "reason": arguments["reason"]})
+            print("decision:", recorded_decision)
             print("reason:", arguments["reason"])
 
             messages.append({"role": "assistant", "tool_calls": [tool_call]})
@@ -419,12 +495,17 @@ def handle_alert(alert_text):
             raise ValueError(f"decision was escalate but model called {tool_name}")
 
         function_to_call = AVAILABLE_FUNCTIONS[tool_name]
+
+        if "alert_text" in arguments:
+            arguments["alert_text"] = alert_text
+
         action_result = function_to_call(**arguments)
         log_event(alert_id, "action", {"tool_called": tool_name, "result": action_result})
 
+        print("final alert stored:", action_result["alert"])
         return action_result
 
 
 
 if __name__ == "__main__":
-    handle_alert("ServiceDown: auth-service health check failing on host prod-app-7, port 8080 not listening")
+    handle_alert("ServiceDown: some-new-service health check failing on host prod-x1, port 8080 not listening")
