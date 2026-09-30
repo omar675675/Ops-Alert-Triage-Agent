@@ -1,0 +1,5 @@
+openai
+pyyaml
+sentence-transformers
+qdrant-client
+langchain-text-splitters
