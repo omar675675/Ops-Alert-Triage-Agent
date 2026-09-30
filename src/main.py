@@ -5,11 +5,14 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 import json
 from datetime import datetime, timezone
+from pathlib import Path
+import uuid
+
 
 # ---------------- VARIABLES ----------------
 
 # settings loaded from config.yaml (qdrant url, model names, api key, etc.)
-with open("../config.yaml") as f:
+with open(Path(__file__).parent.parent / "config.yaml") as f:
     config = yaml.safe_load(f)
 
 # client used to send requests to the LLM (Groq, using the OpenAI-compatible API)
@@ -33,6 +36,7 @@ ALERT_TYPES = [
     "certificate_expiring",
 ]
 
+AUDIT_LOG_PATH = Path(__file__).parent.parent / "audit_log.jsonl"
 
 # ---------------- TOOLS ----------------
 
@@ -64,6 +68,21 @@ tools = [
                     "reason": {"type": "string", "description": "why this needs human approval"},
                 },
                 "required": ["alert_text", "reason"],
+            },
+        },
+    },
+        {
+        "type": "function",
+        "function": {
+            "name": "record_decision",
+            "description": "Record your decision for this alert before taking any action. Call this once you have enough information to decide whether the alert can be auto-resolved or needs a human.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "decision": {"type": "string", "enum": ["auto_resolve", "escalate"]},
+                    "reason": {"type": "string", "description": "why you made this decision, citing the runbook and any evidence you gathered"},
+                },
+                "required": ["decision", "reason"],
             },
         },
     },
@@ -302,65 +321,110 @@ AVAILABLE_FUNCTIONS = {
     "check_service_status": check_service_status,
 }
 
+def log_event(alert_id, event_type, data):
+    entry = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "alert_id": alert_id,
+        "event_type": event_type,
+        "data": data,
+    }
+
+    with open(AUDIT_LOG_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
 
 def handle_alert(alert_text):
+    alert_id = str(uuid.uuid4())[:8]
+
     alert_type = classify_alert(alert_text)
-    runbook = get_full_runbook(alert_type)
-    decision_result = decide_action(alert_text, runbook)
-
+    log_event(alert_id, "classification", {"alert_text": alert_text, "alert_type": alert_type})
     print("alert type:", alert_type)
-    print("decision:", decision_result["decision"])
-    print("reason:", decision_result["reason"])
 
-    # the approval gate: this is decided in code, not left to the model to choose
-    if decision_result["decision"] == "auto_resolve":
-        allowed_tool = "restart_service"
-    else:
-        allowed_tool = "escalate_to_human"
+    runbook = get_full_runbook(alert_type)
 
     system_prompt = (
-        f"You resolve infrastructure alerts. A decision has already been made: "
-        f"{decision_result['decision']}. You must call the {allowed_tool} tool "
-        f"to carry it out. Do not call any other tool."
+        "You resolve infrastructure alerts. You are given an alert and its runbook. "
+        "Do not guess facts that are not stated in the alert or the runbook. If you "
+        "are not sure whether a condition applies (for example, whether a host is "
+        "stateful, a database, or production), call check_service_status first.\n\n"
+        "Once you have enough information, call record_decision with auto_resolve "
+        "or escalate and your reason.\n\n"
+        "After that, call restart_service if you decided auto_resolve, or "
+        "escalate_to_human if you decided escalate. Only call the action that "
+        "matches your recorded decision."
     )
 
-    user_message = f"ALERT:\n{alert_text}\n\nRUNBOOK:\n{runbook}\n\nREASON FOR DECISION:\n{decision_result['reason']}"
+    user_message = f"ALERT:\n{alert_text}\n\nRUNBOOK:\n{runbook}"
 
-    response = llm.chat.completions.create(
-        model=config["classifier_model"],
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        tools=tools,
-        temperature=0,
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
 
-    message = response.choices[0].message
+    recorded_decision = None
 
-    if not message.tool_calls:
-        raise ValueError(f"model did not call a tool:\n{message.content}")
+    while True:
+        response = llm.chat.completions.create(
+            model=config["classifier_model"],
+            messages=messages,
+            tools=tools,
+            temperature=0,
+        )
 
-    tool_call = message.tool_calls[0]
-    tool_name = tool_call.function.name
+        message = response.choices[0].message
 
-    # the actual gate: even if the model tries to call the wrong tool, this stops it
-    if tool_name != allowed_tool:
-        raise ValueError(f"model called {tool_name} but only {allowed_tool} is allowed for this decision")
+        if not message.tool_calls:
+            log_event(alert_id, "error", {"message": "model did not call a tool", "raw_reply": message.content})
+            raise ValueError(f"model did not call a tool:\n{message.content}")
 
-    arguments = json.loads(tool_call.function.arguments)
+        tool_call = message.tool_calls[0]
+        tool_name = tool_call.function.name
+        arguments = json.loads(tool_call.function.arguments)
 
-    # we already have the real alert text, don't trust the model's copy of it
-    if "alert_text" in arguments:
-        arguments["alert_text"] = alert_text
+        if "alert_text" in arguments:
+            arguments["alert_text"] = alert_text
 
-    function_to_call = AVAILABLE_FUNCTIONS[tool_name]
-    action_result = function_to_call(**arguments)
+        # diagnostic step: run it, log it, feed the result back, keep going
+        if tool_name == "check_service_status":
+            function_to_call = AVAILABLE_FUNCTIONS[tool_name]
+            tool_result = function_to_call(**arguments)
+            log_event(alert_id, "diagnostic", {"tool_called": tool_name, "result": tool_result})
 
-    return action_result
+            messages.append({"role": "assistant", "tool_calls": [tool_call]})
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(tool_result)})
+            continue
+
+        # the model recording its decision: save it, feed it back, keep going
+        if tool_name == "record_decision":
+            recorded_decision = arguments["decision"]
+            log_event(alert_id, "decision", {"decision": arguments["decision"], "reason": arguments["reason"]})
+            print("decision:", arguments["decision"])
+            print("reason:", arguments["reason"])
+
+            messages.append({"role": "assistant", "tool_calls": [tool_call]})
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": "decision recorded"})
+            continue
+
+        # anything else is a real action: this is where we check it against the recorded decision
+        if recorded_decision is None:
+            log_event(alert_id, "error", {"message": f"model called {tool_name} before recording a decision"})
+            raise ValueError(f"model called {tool_name} before calling record_decision")
+
+        if recorded_decision == "auto_resolve" and tool_name != "restart_service":
+            log_event(alert_id, "error", {"message": f"decision was auto_resolve but model called {tool_name}"})
+            raise ValueError(f"decision was auto_resolve but model called {tool_name}")
+
+        if recorded_decision == "escalate" and tool_name != "escalate_to_human":
+            log_event(alert_id, "error", {"message": f"decision was escalate but model called {tool_name}"})
+            raise ValueError(f"decision was escalate but model called {tool_name}")
+
+        function_to_call = AVAILABLE_FUNCTIONS[tool_name]
+        action_result = function_to_call(**arguments)
+        log_event(alert_id, "action", {"tool_called": tool_name, "result": action_result})
+
+        return action_result
+
 
 
 if __name__ == "__main__":
-    test_alert = "ServiceDown: payment-api health check failing on host prod-web-3, port 8080 not listening"
-    result = handle_alert(test_alert)
-    print("action result:", result)
+    handle_alert("ServiceDown: auth-service health check failing on host prod-app-7, port 8080 not listening")
