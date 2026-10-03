@@ -505,11 +505,19 @@ def handle_alert(alert_text):
         return escalate_after_failure(alert_id, alert_text[:200], f"Alert rejected before processing: {problem}")
 
 
-    alert_type = classify_alert(alert_text)
+    try:
+        alert_type = classify_alert(alert_text)
+    except Exception as error:
+        error_text = str(error)[:200]
+        return escalate_after_failure(alert_id, alert_text, f"Automatic handling stopped: classification failed ({error_text})")
     log_event(alert_id, "classification", {"alert_text": alert_text, "alert_type": alert_type})
     print("alert type:", alert_type)
 
-    runbook = get_full_runbook(alert_type)
+    try:
+        runbook = get_full_runbook(alert_type)
+    except Exception as error:
+        error_text = str(error)[:200]
+        return escalate_after_failure(alert_id, alert_text, f"Automatic handling stopped: runbook lookup failed ({error_text})")
 
     system_prompt = (
         "You resolve infrastructure alerts. You are given an alert and its runbook. "
@@ -663,5 +671,5 @@ def escalate_after_failure(alert_id, alert_text, reason):
 
 
 if __name__ == "__main__":
-    for _ in range(3):
-        handle_alert("ServiceDown: auth-service health check failing on host prod-app-7, port 8080 not listening")
+    for _ in range(4):
+        handle_alert("ServiceDown: billing-worker health check failing on host prod-app-2, port 9200 not listening")
