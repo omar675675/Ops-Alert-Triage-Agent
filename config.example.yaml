@@ -5,4 +5,4 @@ docs_dir: docs
 provider_base_url: https://api.groq.com/openai/v1
 classifier_model: openai/gpt-oss-20b
 writer_model: openai/gpt-oss-120b
-groq_api_key: your-groq-api-key-here
+api_key: your-groq-api-key-here

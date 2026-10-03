@@ -1,0 +1,20 @@
+services:
+  internal-metrics-exporter:
+    stateless: true
+    environment: staging
+    critical: false
+
+  payment-api:
+    stateless: false
+    environment: production
+    critical: true
+
+  auth-service:
+    stateless: true
+    environment: production
+    critical: true
+
+  billing-worker:
+    stateless: true
+    environment: production
+    critical: true
