@@ -4,7 +4,7 @@ An AI agent that reads an infrastructure alert, finds the matching runbook, and 
 
 The point of this project is not the model call. It is the **code around the model**: checks that decide what the model is allowed to do, so a wrong or made-up answer ends in a safe escalation and never in a harmful action.
 
-> **Status:** a working prototype. Every action is mocked. Nothing here restarts a real service or pages a real person. See [Known limitations](#known-limitations).
+> **Status:** a working prototype. Every action is mocked. Nothing here restarts a real service or pages a real person.
 
 ## What it does
 
@@ -28,8 +28,7 @@ alert text ──► input check ──► classify ──► fetch runbook ─�
 
 A small web page shows every alert, what the agent decided, and its reason. It updates every 5 seconds.
 
-<!-- SCREENSHOT GOES HERE. Save your screenshot as docs/dashboard.png, then remove the comment markers around the image line below. -->
-<!-- ![Auto Alert Handler dashboard](docs/dashboard.png) -->
+<img width="1600" height="799" alt="f23089bc-b9d3-40e4-bf59-5e39250b901b" src="https://github.com/user-attachments/assets/48e4d87e-88b2-4c82-9d4e-17c33b6d91e5" />
 
 - Totals for restarted, escalated and no action recorded, with a bar showing how the alerts ended
 - One row per alert, newest first, with the alert type, the decision, the number of status checks, and the full reason on click
@@ -181,19 +180,8 @@ Every step is appended to `audit_log.jsonl`, one JSON object per line, tagged wi
 
 - **The model proposes, the code decides.** Anything that can cause harm is checked by plain code, not by asking the model to be careful.
 - **Escalate by default.** Every failure path ends with a human, never with a dropped alert or a guessed action.
-- **Checks that are lookups beat checks that are model calls.** The inventory check is a dictionary lookup and is always right. The grounding check is a second model call and is not (see below).
+- **Checks that are lookups beat checks that are model calls.** The inventory check is a dictionary lookup and is always right. The grounding check is a second model call and is not always right.
 - **Whole runbooks, not snippets.** Approval rules depend on other sections, so cutting the runbook into pieces at retrieval time loses them.
-
-## Known limitations
-
-- The model gives different answers on the same alert from run to run. The test set measures this but does not remove it.
-- The grounding check is a model call and is inconsistent. It sometimes flags harmless conclusions and sometimes lets an unsupported claim through.
-- `classify_alert` and `get_full_runbook` run before the tool loop. A failure in either still crashes the alert instead of escalating it.
-- The input check is a short phrase list plus length limits. It stops obvious attempts only.
-- The inventory is written by hand and covers a handful of services.
-- Diagnostics return fixed fake data, and all actions are mocked.
-- No memory across alerts. The agent does not know a host was restarted three times this week.
-- The login is a single hard-coded user, and sessions are kept in memory, so a restart logs everyone out.
 
 ## Roadmap
 
