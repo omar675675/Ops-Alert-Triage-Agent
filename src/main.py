@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
+import threading
 
 
 # ---------------- VARIABLES ----------------
@@ -368,6 +369,9 @@ AVAILABLE_FUNCTIONS = {
     "check_service_status": check_service_status,
 }
 
+# only one thread writes to the audit log at a time, so lines never mix together
+AUDIT_LOG_LOCK = threading.Lock()
+
 def log_event(alert_id, event_type, data):
     entry = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -376,8 +380,10 @@ def log_event(alert_id, event_type, data):
         "data": data,
     }
 
-    with open(AUDIT_LOG_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    line = json.dumps(entry) + "\n"
+    with AUDIT_LOG_LOCK:
+        with open(AUDIT_LOG_PATH, "a") as f:
+            f.write(line)
 
 def check_reason_is_grounded(alert_text, runbook, reason, diagnostics_gathered):
     diagnostics_text = ""

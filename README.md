@@ -1,37 +1,163 @@
-# Ops Alert Triage Agent
+# Auto Alert Handler
 
-A prototype agent that reads an infrastructure alert, looks up the matching runbook, decides whether the alert can be handled automatically or needs a human, and carries out that decision with a tool.
+An AI agent that reads an infrastructure alert, finds the matching runbook, and decides what to do: fix it itself or hand it to a human. A live dashboard shows what it did and why.
 
-## Status
+The point of this project is not the model call. It is the **code around the model**: checks that decide what the model is allowed to do, so a wrong or made-up answer ends in a safe escalation and never in a harmful action.
 
-Early-stage prototype, built as a learning project. Every action is mocked: nothing here restarts a real service or pages a real person. The diagnostic tool returns fixed fake data. Not production-ready.
+> **Status:** a working prototype. Every action is mocked. Nothing here restarts a real service or pages a real person. See [Known limitations](#known-limitations).
 
-## How it works
+## What it does
 
-1. **Input check.** The alert is checked before any model sees it. An empty alert, one longer than 1000 characters, or one containing a known injection phrase is escalated to a human immediately.
-2. **Classify.** `classify_alert` labels the alert as one of five types.
-3. **Retrieve.** `get_full_runbook` pulls every section of the matching runbook from Qdrant, filtered by alert type.
-4. **Tool loop.** The model gets the alert and the runbook and can take up to 8 steps. It can call `check_service_status` to gather evidence, then `record_decision` with `auto_resolve` or `escalate`, then the action tool that matches that decision.
-5. **Checks in code.** Between the model's steps, plain code enforces the rules listed below. The model proposes, the code decides what is allowed to run.
-6. **Fallback.** If anything goes wrong, the alert is escalated to a human. It is never silently dropped.
+```
+alert text ──► input check ──► classify ──► fetch runbook ──► tool loop ──► action
+                  │                              (Qdrant)         │
+                  │                                               ├─ check_service_status
+                  ▼                                               ├─ record_decision
+            escalate to human ◄── any failure, any blocked check ─┘  restart_service
+                                                                      escalate_to_human
+```
+
+1. **Input check.** The alert is checked before any model sees it. An empty alert, one over 1000 characters, or one with a known injection phrase goes straight to a human.
+2. **Classify.** The model labels the alert as one of five types.
+3. **Retrieve.** The full runbook for that type is pulled from a Qdrant vector database.
+4. **Tool loop.** The model gets up to 8 steps. It can check a service's status, record a decision (`auto_resolve` or `escalate`), and then call the action that matches.
+5. **Checks in code.** Between the model's steps, plain code enforces the safety rules below. The model proposes. The code decides what runs.
+6. **Fallback.** If anything goes wrong, the alert is escalated. It is never silently dropped.
+
+## Dashboard
+
+A small web page shows every alert, what the agent decided, and its reason. It updates every 5 seconds.
+
+<!-- SCREENSHOT GOES HERE. Save your screenshot as docs/dashboard.png, then remove the comment markers around the image line below. -->
+<!-- ![Auto Alert Handler dashboard](docs/dashboard.png) -->
+
+- Totals for restarted, escalated and no action recorded, with a bar showing how the alerts ended
+- One row per alert, newest first, with the alert type, the decision, the number of status checks, and the full reason on click
+- Dark and light mode, and a layout that works on a phone
+- Login required
 
 ## Safeguards
 
-- **Input check.** Rejects empty, oversized, or suspicious alerts before the model is called.
-- **Argument check.** Any `host` or `service` the model passes to a tool must appear in the alert text. An invented value is blocked, the model is told why and gets one retry, and a second invented value escalates to a human.
-- **Approval gate.** The action the model takes must match the decision it recorded. A mismatch escalates.
-- **Inventory check.** An `auto_resolve` only goes through if every service the model checked is listed in `inventory.yaml`, is stateless, and is not production-critical. Otherwise it is forced to escalate.
-- **Grounding check.** For `auto_resolve` decisions only, a second model call checks whether the claims in the model's reason are supported by the alert, the runbook, or the diagnostic results. An unsupported reason forces an escalation. Escalating is always safe, so `escalate` decisions are not checked.
-- **Failure fallback.** A failed model call, a missing tool call, an unexpected action, or running out of steps all end in an escalation to a human.
+| Safeguard | What it stops |
+|---|---|
+| **Input check** | Empty, oversized or injection-style alerts never reach the model. |
+| **Argument check** | A `host` or `service` the model passes to a tool must appear in the alert text. An invented value is blocked, the model gets one retry, and a second one escalates. |
+| **Approval gate** | The action the model takes must match the decision it recorded. A mismatch escalates. |
+| **Inventory check** | `auto_resolve` only goes through if every service checked is in `inventory.yaml`, is stateless, and is not production-critical. Unknown services are never restarted. |
+| **Grounding check** | For `auto_resolve` only, a second model call checks that the claims in the reason are backed by the alert, the runbook or the diagnostics. An unsupported reason forces an escalation. |
+| **Failure fallback** | A failed model call, a missing tool call, an unexpected action, or running out of steps all end in an escalation. |
 
-## Tools
+Escalating is always safe, so `escalate` decisions are not checked. Only the risky path is.
 
-All tools are mocked.
+## Tech
 
-- `check_service_status(host, service)`: returns fake process and log status, plus what the inventory says about the service.
-- `record_decision(decision, reason)`: the model states `auto_resolve` or `escalate`. It has no real-world effect. Your code reads the arguments directly.
-- `restart_service(host, service)`: logs what a restart would do.
-- `escalate_to_human(alert_text, reason)`: logs what a handoff to a human would look like.
+- **Python**, with the OpenAI-compatible API on **Groq** (`openai/gpt-oss-20b`)
+- **Qdrant** for runbook retrieval, **sentence-transformers** for embeddings
+- **FastAPI** and **uvicorn** for the server, plain HTML, CSS and JavaScript for the dashboard (no build step)
+- An append-only **JSON Lines audit log** of every step
+
+## Quick start
+
+You need Python 3.10+, Docker and a Groq API key.
+
+```bash
+git clone <repo-url>
+cd <repo-folder>
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# start the vector database
+docker run -d -p 6333:6333 -v qdrant_storage:/qdrant/storage --name qdrant qdrant/qdrant
+
+# add your key
+cp config.example.yaml config.yaml      # then set api_key in config.yaml
+
+# load the runbooks into Qdrant (expected output: "stored 35 chunks")
+python src/rag.py
+```
+
+Run the server and open <http://127.0.0.1:8000>:
+
+```bash
+python src/server.py
+```
+
+Log in with `admin` / `admin`. In a second terminal, send some fake alerts:
+
+```bash
+python src/alert_generator.py
+```
+
+The generator sends 5 alerts, 30 seconds apart. The pause is there so a free Groq daily token limit lasts. You can watch each one appear on the dashboard.
+
+## Tests
+
+`src/test_alerts.py` holds 13 alerts, each with the action the agent should end with. `src/run_tests.py` runs every alert 5 times, because the model gives different answers between runs, and prints a pass count per case.
+
+```bash
+python src/run_tests.py
+```
+
+It also counts the two failures that matter most:
+
+- **unsafe restarts:** the agent restarted something when a human was needed
+- **crashes:** an alert was lost
+
+Test runs write to `test_audit_log.jsonl`, so they do not fill the real log.
+
+## API
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/` | The dashboard |
+| `GET` / `POST` | `/login` | The login page and the login form |
+| `GET` | `/logout` | Ends the session |
+| `GET` | `/alerts` | The newest 200 alerts as JSON, grouped by alert ID |
+| `POST` | `/alert` | Sends one alert: `{"text": "..."}`. Returns what the agent did |
+
+Everything except `/login` needs a login. A script can use HTTP basic auth:
+
+```bash
+curl -u admin:admin -H 'Content-Type: application/json' \
+  -d '{"text": "ServiceDown: billing-worker health check failing on host prod-app-2, port 9200 not listening"}' \
+  http://127.0.0.1:8000/alert
+```
+
+The login is `admin` / `admin` and is written in the code. That is fine on your own machine. Change it before the server is reachable from anywhere else.
+
+## Project layout
+
+```
+src/
+  main.py             the agent: checks, tool loop, mocked tools, audit log
+  rag.py              loads the runbooks into Qdrant
+  server.py           FastAPI server and login
+  dashboard.html      the dashboard
+  alert_generator.py  sends fake alerts to the server
+  test_alerts.py      test alerts and their expected outcomes
+  run_tests.py        runs the tests several times each
+docs/                 five runbooks, one per alert type
+inventory.yaml        the known services and facts about them
+config.example.yaml   settings template
+```
+
+## Runbooks
+
+Five markdown files in `docs/`: disk usage, service down, high CPU, high latency, certificate expiry. Each has the same sections:
+
+```
+# <Title>
+## Alert Type
+## Symptoms
+## Diagnosis
+## Resolution
+## Risk Level
+## Approval
+## Escalate When
+```
+
+`rag.py` splits each file on its `##` headers, embeds each section, and stores it in Qdrant with the alert type and section name. The agent gets the **whole** runbook for each alert, because the approval rules refer to conditions in other sections.
 
 ## Inventory
 
@@ -45,90 +171,34 @@ services:
     critical: false
 ```
 
-A service that is not listed is never auto-restarted, because nothing is known about it. Add services here to make them eligible.
-
-## Runbooks
-
-Five markdown files in `docs/`, one per alert type: disk usage, service down, high CPU, high latency, certificate expiry. Each follows the same structure:
-
-```
-# <Title>
-## Alert Type
-## Symptoms
-## Diagnosis
-## Resolution
-## Risk Level
-## Approval
-## Escalate When
-```
-
-`rag.py` splits each file on its `##` headers, so every section becomes one chunk, embeds the chunks, and stores them in Qdrant with the alert type and section name as payload fields. The full runbook is retrieved for each alert, because the approval rules refer to conditions described in other sections.
+A service that is not listed is never auto-restarted, because nothing is known about it.
 
 ## Audit log
 
-Every step is appended to `audit_log.jsonl`, one JSON object per line, tagged with an alert ID. Event types: `classification`, `diagnostic`, `guardrail_check`, `decision`, `action`, `error`, `input_blocked`.
+Every step is appended to `audit_log.jsonl`, one JSON object per line, tagged with an alert ID. Event types: `classification`, `diagnostic`, `guardrail_check`, `decision`, `action`, `error`, `input_blocked`. The dashboard is built from this file. Writes are guarded by a lock so lines from different alerts never mix.
 
-## Setup
+## Design choices
 
-Prerequisites: Python 3.10+, Docker, a Groq API key.
-
-```bash
-git clone <repo-url>
-cd <repo-folder>
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-Start Qdrant:
-
-```bash
-docker run -d -p 6333:6333 -v qdrant_storage:/qdrant/storage --name qdrant qdrant/qdrant
-```
-
-Copy the config template and add your key:
-
-```bash
-cp config.example.yaml config.yaml
-```
-
-Edit `config.yaml` and set `api_key`. `config.yaml` and `audit_log.jsonl` are in `.gitignore` and should not be committed.
-
-Load the runbooks into Qdrant:
-
-```bash
-python src/rag.py
-```
-
-Expected output: `stored 35 chunks`.
-
-Run the agent. Testing is manual: edit the alerts in the `__main__` block at the bottom of `src/main.py`, then run:
-
-```bash
-python src/main.py
-```
-
-## Models
-
-All steps currently use `classifier_model` (`openai/gpt-oss-20b` on Groq). `writer_model` (`openai/gpt-oss-120b`) is in the config but not used yet.
+- **The model proposes, the code decides.** Anything that can cause harm is checked by plain code, not by asking the model to be careful.
+- **Escalate by default.** Every failure path ends with a human, never with a dropped alert or a guessed action.
+- **Checks that are lookups beat checks that are model calls.** The inventory check is a dictionary lookup and is always right. The grounding check is a second model call and is not (see below).
+- **Whole runbooks, not snippets.** Approval rules depend on other sections, so cutting the runbook into pieces at retrieval time loses them.
 
 ## Known limitations
 
-- The model gives different answers on the same alert from run to run. There is no test set yet, so changes are checked by reading output by hand.
-- The grounding check is itself a model call and is inconsistent. It sometimes flags harmless conclusions and sometimes lets an unsupported claim through. The inventory check does not have this problem, because it is a plain lookup.
-- `classify_alert` and `get_full_runbook` run before the tool loop, and a failure in either still crashes the alert instead of escalating it.
-- The input check is a short phrase list plus length limits. It stops obvious attempts only, since any fixed list can be reworded around.
+- The model gives different answers on the same alert from run to run. The test set measures this but does not remove it.
+- The grounding check is a model call and is inconsistent. It sometimes flags harmless conclusions and sometimes lets an unsupported claim through.
+- `classify_alert` and `get_full_runbook` run before the tool loop. A failure in either still crashes the alert instead of escalating it.
+- The input check is a short phrase list plus length limits. It stops obvious attempts only.
 - The inventory is written by hand and covers a handful of services.
-- Diagnostics return fixed fake data.
-- Alerts are entered by editing the code. There is no queue, API, or UI.
-- No memory across alerts. The agent does not know that a host was restarted three times this week.
-- The audit log is append-only JSON lines. It is built to be read by a program, not by eye.
+- Diagnostics return fixed fake data, and all actions are mocked.
+- No memory across alerts. The agent does not know a host was restarted three times this week.
+- The login is a single hard-coded user, and sessions are kept in memory, so a restart logs everyone out.
 
 ## Roadmap
 
-- Automated test set with known-correct outcomes for each kind of alert
 - Wrap `classify_alert` and `get_full_runbook` in the same failure fallback
-- Mock ticket generator sending alerts to a running `main.py` through an API
-- Dashboard or desktop UI reading `audit_log.jsonl`
+- Move the login out of the code and into config
 - Alert format check as part of the input guardrail
 - History of past actions per host
+- Real diagnostics and actions behind the same safeguards

@@ -1,1 +1,18 @@
+# secrets and local settings
 config.yaml
+.env
+
+# runtime logs written by the agent and the tests
+audit_log.jsonl
+test_audit_log.jsonl
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# editor and OS files
+.vscode/
+.idea/
+.DS_Store

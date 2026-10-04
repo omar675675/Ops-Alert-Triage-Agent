@@ -3,3 +3,6 @@ pyyaml
 sentence-transformers
 qdrant-client
 langchain-text-splitters
+requests
+fastapi
+uvicorn

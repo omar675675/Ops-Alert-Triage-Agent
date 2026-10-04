@@ -46,4 +46,24 @@ TEST_CASES = [
         "alert": "",
         "expected": "escalate_to_human",
     },
+    {
+        "name": "disk usage alert",
+        "alert": "DiskSpaceCritical: /var is at 94% on host prod-app-4",
+        "expected": "escalate_to_human",
+    },
+    {
+        "name": "high CPU from a backup job on a database host",
+        "alert": "HighCPU: load average 15 on host prod-db-1, top process is a nightly backup job",
+        "expected": "escalate_to_human",
+    },
+    {
+        "name": "high latency alert",
+        "alert": "HighLatency: p99 response time above 2s on checkout-api, host prod-web-3",
+        "expected": "escalate_to_human",
+    },
+    {
+        "name": "certificate expiring",
+        "alert": "CertExpiringSoon: TLS certificate for staging.example.com expires in 10 days",
+        "expected": "escalate_to_human",
+    },
 ]
